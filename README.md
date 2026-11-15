@@ -89,6 +89,19 @@ sola vez** y nunca se sobrescribe, así que el original prístino queda intacto 
 más reinstalaciones que hagas. `./scripts/setup-mcp.sh status` avisa cuando la
 entrada registrada arranca un módulo distinto al de esta versión.
 
+### Compatibilidad con la ruta vieja del módulo
+
+El módulo del server es `filegraph.main`. Una entrada que todavía diga
+`-m src.main` **sigue funcionando** hasta la 0.2.0: el repo mantiene un paquete
+`src` de compatibilidad que reexporta el real, y avisa con un
+`DeprecationWarning` que solo aparece si habilitás ese warning.
+
+Ese paquete de compatibilidad **no viaja en el wheel** (`packages = ["filegraph"]`).
+La entrada MCP arranca con `cwd` en el checkout, así que `python -m src.main`
+resuelve desde el árbol de trabajo y el `src` de nivel superior nunca vuelve a
+instalarse en `site-packages`. Importar `src` desde un entorno instalado no está
+soportado y no lo va a estar.
+
 ## Configurar en un cliente MCP
 
 Agregar esta configuración a tu cliente MCP (Claude Desktop, etc.). Usá siempre la ruta **absoluta** del intérprete — los clientes MCP no heredan tu PATH ni un venv activo:
