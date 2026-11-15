@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from src.cli import main
-from src.store import cache_stats, init_db
+from filegraph.cli import main
+from filegraph.store import cache_stats, init_db
 
 
 class TestCliIndex:

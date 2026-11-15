@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from src.store import (
+from filegraph.store import (
     cache_stats,
     get_cache,
     get_file_set,

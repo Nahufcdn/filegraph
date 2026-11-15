@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from src.cache import make_cache_key
-from src.store import get_cache, init_db
-from src.tools import (
+from filegraph.cache import make_cache_key
+from filegraph.store import get_cache, init_db
+from filegraph.tools import (
     find_duplicates,
     find_patterns,
     scan_directory,

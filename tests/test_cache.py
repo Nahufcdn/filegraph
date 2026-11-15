@@ -10,8 +10,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.cache import check_freshness, extract_file_set, get_or_scan, make_cache_key
-from src.store import init_db, set_cache
+from filegraph.cache import check_freshness, extract_file_set, get_or_scan, make_cache_key
+from filegraph.store import init_db, set_cache
 
 
 # ---------------------------------------------------------------------------

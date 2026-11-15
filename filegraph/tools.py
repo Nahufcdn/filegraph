@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.cache import check_freshness, get_or_scan
-from src.scanner import (
+from filegraph.cache import check_freshness, get_or_scan
+from filegraph.scanner import (
     DEFAULT_EXCLUDED_DIRS,
     _resolve_exclusions,
     file_info,
@@ -14,7 +14,7 @@ from src.scanner import (
     scan_tree,
     search_files,
 )
-from src.store import cache_stats, invalidate_path, list_entries_by_path
+from filegraph.store import cache_stats, invalidate_path, list_entries_by_path
 
 
 def scan_directory(

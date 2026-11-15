@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from src.scanner import (
+from filegraph.scanner import (
     DEFAULT_EXCLUDED_DIRS,
     _resolve_exclusions,
     file_info,

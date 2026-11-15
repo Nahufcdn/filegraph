@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastmcp import FastMCP
 
-from src.tools import (
+from filegraph.tools import (
     cache_status,
     find_duplicates,
     find_patterns,
