@@ -5,6 +5,9 @@ set -euo pipefail
 
 OPENCODE_CONFIG="${OPENCODE_CONFIG:-}"
 SERVER_NAME="filegraph"
+# Single source of truth for the module the MCP entry starts. The entry is
+# launched as `python -m <MCP_MODULE>` with cwd set to the project.
+MCP_MODULE="filegraph.main"
 PROJECT_DIR=""
 
 # ─── Package manager hints ────────────────────────────────────────────────────
@@ -200,18 +203,32 @@ cmd_install() {
 
   assert_config_is_parseable
 
-  # Check if already installed
-  if jq -e ".mcp.${SERVER_NAME}" "$OPENCODE_CONFIG" &>/dev/null; then
-    echo "FileGraph MCP server is already installed."
-    echo "Run '$(basename "$0") uninstall' first to reinstall."
-    exit 0
-  fi
-
   require_project_dir
 
+  # An existing entry is only genuinely installed when it still starts the
+  # module this version ships, from this project. Anything else is repaired
+  # below instead of aborting: the previous unconditional "already installed"
+  # exit made an upgrade report success while the entry kept pointing at a
+  # module name from an older release, and the server silently stopped working.
+  if jq -e ".mcp.${SERVER_NAME}" "$OPENCODE_CONFIG" &>/dev/null; then
+    local installed_module installed_cwd
+    installed_module="$(jq -r --arg name "$SERVER_NAME" '.mcp[$name].command[2] // ""' "$OPENCODE_CONFIG")"
+    installed_cwd="$(jq -r --arg name "$SERVER_NAME" '.mcp[$name].cwd // ""' "$OPENCODE_CONFIG")"
+
+    if [[ "${installed_module}" == "${MCP_MODULE}" && "${installed_cwd}" == "${PROJECT_DIR}" ]]; then
+      echo "FileGraph MCP server is already installed."
+      echo "Run '$(basename "$0") uninstall' first to reinstall."
+      exit 0
+    fi
+
+    echo "Updating the existing FileGraph MCP server entry."
+    echo "   module: ${installed_module:-<none>} -> ${MCP_MODULE}"
+    echo "   cwd:    ${installed_cwd:-<none>} -> ${PROJECT_DIR}"
+  fi
+
   # Verify project has the entry point
-  if [[ ! -f "${PROJECT_DIR}/src/main.py" ]]; then
-    echo "Error: src/main.py not found in ${PROJECT_DIR}" >&2
+  if [[ ! -f "${PROJECT_DIR}/filegraph/main.py" ]]; then
+    echo "Error: filegraph/main.py not found in ${PROJECT_DIR}" >&2
     exit 1
   fi
 
@@ -244,7 +261,7 @@ cmd_install() {
   jq --arg name "$SERVER_NAME" \
      --arg cmd "$interpreter" \
      --arg arg1 "-m" \
-     --arg arg2 "src.main" \
+     --arg arg2 "${MCP_MODULE}" \
      --arg cwd "$PROJECT_DIR" \
      '.mcp[$name] = {
         "command": [$cmd, $arg1, $arg2],
@@ -264,7 +281,7 @@ cmd_install() {
 
   echo "✅ FileGraph MCP server installed in OpenCode."
   echo "   Server: ${SERVER_NAME}"
-  echo "   Command: ${interpreter} -m src.main"
+  echo "   Command: ${interpreter} -m ${MCP_MODULE}"
   echo "   CWD: ${PROJECT_DIR}"
   echo "   Config: ${OPENCODE_CONFIG}"
   echo ""
@@ -328,6 +345,16 @@ cmd_status() {
     echo "✅ FileGraph MCP server is INSTALLED."
     echo ""
     jq ".mcp.${SERVER_NAME}" "$OPENCODE_CONFIG"
+
+    # A registered entry that starts a module this version does not ship still
+    # looks installed but cannot run. Say so instead of reporting plain success.
+    local installed_module
+    installed_module="$(jq -r --arg name "$SERVER_NAME" '.mcp[$name].command[2] // ""' "$OPENCODE_CONFIG")"
+    if [[ "${installed_module}" != "${MCP_MODULE}" ]]; then
+      echo ""
+      echo "⚠️  The entry runs '-m ${installed_module:-<none>}', but this version expects '-m ${MCP_MODULE}'."
+      echo "   Re-run '$(basename "$0") install' to update the entry in place."
+    fi
   else
     echo "❌ FileGraph MCP server is NOT installed."
     echo ""
