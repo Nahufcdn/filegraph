@@ -89,18 +89,17 @@ sola vez** y nunca se sobrescribe, así que el original prístino queda intacto 
 más reinstalaciones que hagas. `./scripts/setup-mcp.sh status` avisa cuando la
 entrada registrada arranca un módulo distinto al de esta versión.
 
-### Compatibilidad con la ruta vieja del módulo
+### Si tu entrada todavía dice `-m src.main`
 
-El módulo del server es `filegraph.main`. Una entrada que todavía diga
-`-m src.main` **sigue funcionando** hasta la 0.2.0: el repo mantiene un paquete
-`src` de compatibilidad que reexporta el real, y avisa con un
-`DeprecationWarning` que solo aparece si habilitás ese warning.
+El módulo del server es `filegraph.main` y el paquete `src` **ya no existe**: una
+entrada vieja no arranca. Volvé a correr el instalador (o
+`./scripts/setup-mcp.sh install`) y la repara en el lugar, diciéndote qué cambió
+— ese es el único camino de migración que queda. `./scripts/setup-mcp.sh status`
+te avisa si la entrada registrada arranca un módulo que esta versión no trae.
 
-Ese paquete de compatibilidad **no viaja en el wheel** (`packages = ["filegraph"]`).
-La entrada MCP arranca con `cwd` en el checkout, así que `python -m src.main`
-resuelve desde el árbol de trabajo y el `src` de nivel superior nunca vuelve a
-instalarse en `site-packages`. Importar `src` desde un entorno instalado no está
-soportado y no lo va a estar.
+Solo `filegraph` viaja en el wheel (`packages = ["filegraph"]`): el `src` de
+nivel superior que publicaban las versiones viejas no vuelve, y algo importable
+como `src` desde `site-packages` no está soportado.
 
 ## Configurar en un cliente MCP
 
