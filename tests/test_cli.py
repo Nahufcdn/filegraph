@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from src.cli import main
+from filegraph.cli import main
 
 
 class TestCliScan:

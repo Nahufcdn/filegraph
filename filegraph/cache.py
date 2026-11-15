@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from src.store import get_cache as _store_get, get_file_set, set_cache as _store_set
+from filegraph.store import get_cache as _store_get, get_file_set, set_cache as _store_set
 
 
 def make_cache_key(tool_name: str, path: str, **kwargs) -> str:

@@ -67,6 +67,41 @@ bash ~/.local/share/filegraph/install.sh uninstall
 
 Elimina el server de OpenCode y borra todo su directorio de instalación (repo, venv y uv). El backup `<config>.filegraph.bak` se conserva a propósito.
 
+### Actualizar una instalación existente
+
+Volvé a correr el instalador (o `./scripts/setup-mcp.sh install`). No hace falta
+`uninstall` primero, y de hecho no lo uses como atajo: `uninstall` **borra el
+directorio de instalación** con el repo y el venv adentro.
+
+El instalador compara la entrada ya registrada con la que debería existir. Si el
+módulo o el `cwd` no coinciden — por ejemplo una entrada vieja con `-m src.main`
+de antes de que el paquete se llamara `filegraph` — **la reescribe en el lugar** y
+te dice qué cambió:
+
+```
+Updating the existing FileGraph MCP server entry.
+   module: src.main -> filegraph.main
+   cwd:    /clon/viejo -> /clon/actual
+```
+
+Si ya coincide, no toca nada. El backup `<config>.filegraph.bak` se crea **una
+sola vez** y nunca se sobrescribe, así que el original prístino queda intacto por
+más reinstalaciones que hagas. `./scripts/setup-mcp.sh status` avisa cuando la
+entrada registrada arranca un módulo distinto al de esta versión.
+
+### Compatibilidad con la ruta vieja del módulo
+
+El módulo del server es `filegraph.main`. Una entrada que todavía diga
+`-m src.main` **sigue funcionando** hasta la 0.2.0: el repo mantiene un paquete
+`src` de compatibilidad que reexporta el real, y avisa con un
+`DeprecationWarning` que solo aparece si habilitás ese warning.
+
+Ese paquete de compatibilidad **no viaja en el wheel** (`packages = ["filegraph"]`).
+La entrada MCP arranca con `cwd` en el checkout, así que `python -m src.main`
+resuelve desde el árbol de trabajo y el `src` de nivel superior nunca vuelve a
+instalarse en `site-packages`. Importar `src` desde un entorno instalado no está
+soportado y no lo va a estar.
+
 ## Configurar en un cliente MCP
 
 Agregar esta configuración a tu cliente MCP (Claude Desktop, etc.). Usá siempre la ruta **absoluta** del intérprete — los clientes MCP no heredan tu PATH ni un venv activo:
@@ -76,7 +111,7 @@ Agregar esta configuración a tu cliente MCP (Claude Desktop, etc.). Usá siempr
   "mcpServers": {
     "filegraph": {
       "command": "/ruta/a/filegraph/.venv/bin/python",
-      "args": ["-m", "src.main"],
+      "args": ["-m", "filegraph.main"],
       "cwd": "/ruta/a/filegraph"
     }
   }
@@ -97,7 +132,7 @@ pi mcp add filegraph \
   --cwd /ruta/a/filegraph \
   --exposure direct \
   --description "Directory scanning: directory trees, search by extension, duplicate files by hash, naming patterns, file metadata, and a SQLite scan cache" \
-  -- /ruta/a/filegraph/.venv/bin/python -m src.main
+  -- /ruta/a/filegraph/.venv/bin/python -m filegraph.main
 ```
 
 La entrada que queda escrita es esta:
@@ -107,7 +142,7 @@ La entrada que queda escrita es esta:
   "mcpServers": {
     "filegraph": {
       "command": "/ruta/a/filegraph/.venv/bin/python",
-      "args": ["-m", "src.main"],
+      "args": ["-m", "filegraph.main"],
       "cwd": "/ruta/a/filegraph",
       "exposure": "direct",
       "description": "Directory scanning: directory trees, search by extension, duplicate files by hash, naming patterns, file metadata, and a SQLite scan cache"
@@ -346,11 +381,12 @@ python -m pytest tests/ -v
 filegraph/
 ├── pyproject.toml
 ├── .github/workflows/ci.yml
-├── src/
+├── filegraph/
 │   ├── __init__.py
 │   ├── main.py           # Entry point del server MCP
 │   ├── tools.py          # Definición de las tools MCP
 │   ├── scanner.py        # Lógica core de escaneo
+│   ├── store.py          # Persistencia SQLite del cache
 │   ├── cache.py          # SQLite cache manager
 │   └── cli.py            # Comando CLI filegraph
 └── tests/

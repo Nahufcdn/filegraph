@@ -489,8 +489,8 @@ print_action_summary() {
 smoke_test() {
   SMOKE_REASON=""
 
-  if [[ ! -f "${INSTALL_DIR}/src/main.py" ]]; then
-    SMOKE_REASON="src/main.py is missing from ${INSTALL_DIR}"
+  if [[ ! -f "${INSTALL_DIR}/filegraph/main.py" ]]; then
+    SMOKE_REASON="filegraph/main.py is missing from ${INSTALL_DIR}"
     return 1
   fi
 
@@ -500,15 +500,15 @@ smoke_test() {
     cap="timeout 15"
   fi
 
-  # src/main.py only calls mcp.run() under `if __name__ == "__main__"`, so
-  # importing it exercises the real startup path without starting a server.
-  if ( cd "${INSTALL_DIR}" && ${cap} "${CHOSEN_PYTHON}" -c "import src.main" ) &>/dev/null; then
+  # filegraph/main.py only calls mcp.run() under `if __name__ == "__main__"`,
+  # so importing it exercises the real startup path without starting a server.
+  if ( cd "${INSTALL_DIR}" && ${cap} "${CHOSEN_PYTHON}" -c "import filegraph.main" ) &>/dev/null; then
     return 0
   fi
 
   # If the deps import but the module does not, say so precisely.
   if ( cd "${INSTALL_DIR}" && ${cap} "${CHOSEN_PYTHON}" -c "import fastmcp" ) &>/dev/null; then
-    SMOKE_REASON="the dependencies import, but \`import src.main\` failed — run it by hand to see why:\n      (cd '${INSTALL_DIR}' && '${CHOSEN_PYTHON}' -c 'import src.main')"
+    SMOKE_REASON="the dependencies import, but \`import filegraph.main\` failed — run it by hand to see why:\n      (cd '${INSTALL_DIR}' && '${CHOSEN_PYTHON}' -c 'import filegraph.main')"
     return 1
   fi
 
@@ -580,7 +580,7 @@ do_install() {
     smoke_failed=1
     warn "Smoke test failed: ${SMOKE_REASON}"
   else
-    info "Smoke test passed (the interpreter imports src.main)"
+    info "Smoke test passed (the interpreter imports filegraph.main)"
   fi
 
   if [[ "${registration_failed}" -eq 0 ]]; then

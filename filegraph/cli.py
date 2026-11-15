@@ -7,10 +7,10 @@ import json
 import sys
 from pathlib import Path
 
-from src.cache import check_freshness, get_or_scan, make_cache_key
-from src.scanner import scan_tree, _resolve_exclusions
-from src.store import cache_stats, invalidate_path, list_entries_by_path
-from src.tools import (
+from filegraph.cache import check_freshness, get_or_scan, make_cache_key
+from filegraph.scanner import scan_tree, _resolve_exclusions
+from filegraph.store import cache_stats, invalidate_path, list_entries_by_path
+from filegraph.tools import (
     find_duplicates as _find_duplicates,
     find_patterns as _find_patterns,
     scan_directory,
