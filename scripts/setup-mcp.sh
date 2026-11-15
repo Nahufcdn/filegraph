@@ -258,16 +258,20 @@ cmd_install() {
   tmp=$(mktemp "${OPENCODE_CONFIG}.filegraph.XXXXXX")
   trap 'rm -f "'"$tmp"'"' EXIT
 
+  # Merge into the entry instead of replacing it: this script owns `command`,
+  # `type` and `cwd` only. Anything the user added to the entry itself (`env`,
+  # `enabled`, a description, ...) must survive both a fresh install and a
+  # repair, so a bare assignment would silently drop their settings.
   jq --arg name "$SERVER_NAME" \
      --arg cmd "$interpreter" \
      --arg arg1 "-m" \
      --arg arg2 "${MCP_MODULE}" \
      --arg cwd "$PROJECT_DIR" \
-     '.mcp[$name] = {
+     '.mcp[$name] = ((.mcp[$name] // {}) + {
         "command": [$cmd, $arg1, $arg2],
         "type": "local",
         "cwd": $cwd
-      }' "$OPENCODE_CONFIG" > "$tmp"
+      })' "$OPENCODE_CONFIG" > "$tmp"
 
   # Validate JSON before overwriting
   if ! jq empty "$tmp" 2>/dev/null; then
