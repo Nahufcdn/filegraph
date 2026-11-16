@@ -187,3 +187,29 @@ class TestEmptyCacheDbRecovery:
         result = scan_directory(str(tmp_path))
 
         assert result["tree"]["name"] == tmp_path.name
+
+
+class TestFailedScanWritesNoCache:
+    """A filesystem error must not be recorded as a scan result."""
+
+    def test_filesystem_error_leaves_no_cache_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import errno
+
+        from filegraph import fsscan
+
+        target = tmp_path / "share"
+        target.mkdir()
+
+        def _fail(path, *args, **kwargs):
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+
+        monkeypatch.setattr(fsscan, "stat_path", _fail)
+
+        result = scan_directory(str(target))
+
+        assert result["error"] == (
+            f"{os.strerror(errno.ESTALE)} (errno {errno.ESTALE}): {target}"
+        )
+        assert not (target / ".filegraph").exists()

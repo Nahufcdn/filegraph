@@ -727,3 +727,70 @@ class TestFindPatterns:
         for r in results:
             for f in r["files"]:
                 assert ".git" not in f
+
+
+# ---------------------------------------------------------------------------
+# S5/S6: filesystem errors during recursion are warnings, not silence
+# ---------------------------------------------------------------------------
+
+
+class TestScanTreeEntryErrors:
+    def test_entry_error_is_a_warning_and_scan_continues(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failing entry is reported with path and errno; siblings survive."""
+        import errno
+
+        from filegraph import fsscan
+
+        (tmp_path / "ok.txt").write_text("ok")
+        broken = tmp_path / "broken.txt"
+        broken.write_text("x")
+        real_lstat = fsscan.lstat_path
+
+        def _lstat(path, *args, **kwargs):
+            if Path(path) == broken:
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(fsscan, "lstat_path", _lstat)
+
+        result = scan_tree(tmp_path)
+
+        assert result["warnings"] == [
+            f"Error reading {broken}: {os.strerror(errno.EIO)} (errno {errno.EIO})"
+        ]
+        assert {child["name"] for child in result["tree"]["children"]} == {"ok.txt"}
+        assert result["truncated"] is None
+
+
+class TestWalkDirectoryErrors:
+    def test_unreadable_directory_is_a_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """walk_directory passes onerror and records the skipped directory."""
+        import errno
+
+        from filegraph.scanbudget import Budget
+
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "a.txt").write_text("x")
+        bad = tmp_path / "unreadable"
+        bad.mkdir()
+        real_scandir = os.scandir
+
+        def _scandir(path="."):
+            if Path(path) == bad:
+                # os.scandir carries the failing path in filename
+                raise OSError(errno.EIO, os.strerror(errno.EIO), str(bad))
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", _scandir)
+        budget = Budget()
+
+        files = list(walk_directory(tmp_path, budget=budget))
+
+        assert [f.name for f in files] == ["a.txt"]
+        assert budget.warnings == [
+            f"Error reading {bad}: {os.strerror(errno.EIO)} (errno {errno.EIO})"
+        ]

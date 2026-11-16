@@ -4,13 +4,67 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat as stat_module
 from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 
+from filegraph import fsscan
+from filegraph.scanbudget import Budget, resolve_budget, run_budgeted
+
 DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset(
     {".git", "node_modules", "__pycache__", ".venv"}
 )
+
+
+def _list_dir(path: Path) -> list[Path]:
+    """List a directory sorted by name, letting filesystem errors propagate."""
+    return sorted(path.iterdir(), key=lambda p: p.name)
+
+
+def _classify(path: Path) -> str:
+    """Return 'symlink', 'file', 'directory' or 'unknown' for ``path``.
+
+    One ``lstat`` through ``fsscan`` instead of ``is_symlink``/``is_file``/
+    ``is_dir``, so ``EACCES``/``ESTALE``/``ENOTCONN``/``EIO`` raise with their
+    errno instead of answering "not a file, not a directory".
+    """
+    st = fsscan.lstat_path(path)
+    if stat_module.S_ISLNK(st.st_mode):
+        return "symlink"
+    if stat_module.S_ISDIR(st.st_mode):
+        return "directory"
+    if stat_module.S_ISREG(st.st_mode):
+        return "file"
+    return "unknown"
+
+
+def _link_target(path: Path, budget: Budget) -> str:
+    """Return a symlink's resolved target, warning instead of aborting the scan."""
+    try:
+        return str(path.resolve())
+    except OSError as exc:
+        budget.warn(f"Error reading {path}: {fsscan.error_detail(exc)}")
+    try:
+        return os.readlink(path)
+    except OSError:
+        return ""
+
+
+def _worker_budget(
+    session,
+    max_seconds: float | None,
+    deadline: float | None,
+    max_entries: int | None,
+) -> Budget:
+    """Create the budget used inside a scan, streaming when in a worker."""
+    return Budget(
+        max_seconds=max_seconds,
+        deadline=deadline,
+        max_entries=max_entries,
+        on_partial=None if session is None else session.emit,
+        on_warning=None if session is None else session.warn,
+    )
 
 
 def _resolve_exclusions(
@@ -35,24 +89,47 @@ def walk_directory(
     root: Path,
     exclude_dirs: set[str] | None = None,
     max_depth: int | None = None,
+    budget: Budget | None = None,
 ) -> Iterator[Path]:
     """Yield every file path under root, pruning excluded dirs. Skips symlinks.
+
+    Directory read failures are handed to ``os.walk``'s ``onerror`` and recorded
+    in ``budget.warnings`` instead of being silently skipped.
 
     Args:
         root: Root directory to walk.
         exclude_dirs: Set of directory names to skip entirely. None means use
             DEFAULT_EXCLUDED_DIRS; empty set means skip nothing.
         max_depth: Maximum directory depth to traverse. None = unlimited.
+        budget: Budget whose entry cap and deadline bound the walk, and whose
+            ``warnings`` collect errors. None means unbounded.
 
     Yields:
         Path objects for each file found.
     """
-    if not root.is_dir():
+    if budget is None:
+        budget = Budget()
+
+    try:
+        if fsscan.path_kind(root) != "directory":
+            return
+    except OSError as exc:
+        budget.warn(f"Error reading {root}: {fsscan.error_detail(exc)}")
         return
 
     effective_exclude = exclude_dirs if exclude_dirs is not None else DEFAULT_EXCLUDED_DIRS
 
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+    current: dict = {"dir": root}
+
+    def _on_error(exc: OSError) -> None:
+        where = exc.filename or current["dir"]
+        budget.warn(f"Error reading {where}: {fsscan.error_detail(exc)}")
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=_on_error):
+        if budget.truncated is not None:
+            return
+        current["dir"] = Path(dirpath)
+
         # Compute current depth relative to root
         rel = Path(dirpath).relative_to(root)
         depth = len(rel.parts)
@@ -61,18 +138,32 @@ def walk_directory(
             continue
 
         # Prune excluded directories in-place
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in effective_exclude and not Path(dirpath, d).is_symlink()
-        ]
-        dirnames.sort()
+        kept: list[str] = []
+        for dirname in dirnames:
+            if dirname in effective_exclude:
+                continue
+            child_dir = Path(dirpath, dirname)
+            try:
+                if _classify(child_dir) == "symlink":
+                    continue
+            except OSError as exc:
+                budget.warn(f"Error reading {child_dir}: {fsscan.error_detail(exc)}")
+                continue
+            kept.append(dirname)
+        dirnames[:] = sorted(kept)
 
         for fname in sorted(filenames):
             fpath = Path(dirpath) / fname
-            if fpath.is_symlink():
+            try:
+                if _classify(fpath) != "file":
+                    continue
+            except OSError as exc:
+                budget.warn(f"Error reading {fpath}: {fsscan.error_detail(exc)}")
                 continue
-            if fpath.is_file():
-                yield fpath
+            stop = not budget.count_entry()
+            yield fpath
+            if stop:
+                return
 
 
 def scan_tree(
@@ -80,74 +171,178 @@ def scan_tree(
     max_depth: int | None = None,
     exclude_dirs: set[str] | None = None,
     _current_depth: int = 0,
+    max_seconds: float | None = None,
+    max_entries: int | None = None,
 ) -> dict:
     """Build a JSON tree of the directory hierarchy.
 
-    Returns a dict with keys: name, type (directory/file), and children (for dirs).
-    Symlinks are recorded but not followed.
-    Permission errors produce partial results with warnings.
+    Returns a dict with keys: ``tree`` (nested dict), ``warnings`` (list of
+    strings) and ``truncated`` (None for a complete scan, otherwise
+    ``{"reason", "limit", "entries_seen"}``). Symlinks are recorded but not
+    followed. Filesystem errors produce partial results with warnings.
+
+    Args:
+        path: Root directory to scan.
+        max_depth: Maximum depth to traverse. None = unlimited.
+        exclude_dirs: Set of directory names to exclude. None uses defaults.
+        max_seconds: Wall-clock budget. None means the default for the filesystem
+            kind: 45 s on a network mount, no deadline on a local one.
+        max_entries: Entry cap. None means the default for the filesystem kind:
+            200000 on a network mount, no cap on a local one.
     """
-    warnings: list[str] = []
-    result = _scan_node(path, max_depth, _current_depth, warnings, exclude_dirs)
-    return {"tree": result, "warnings": warnings}
+    root = Path(path)
+    max_seconds, max_entries = resolve_budget(root, max_seconds, max_entries)
+    budget = Budget(max_seconds=max_seconds, max_entries=max_entries)
+    args = (
+        str(root),
+        max_depth,
+        exclude_dirs,
+        _current_depth,
+        max_seconds,
+        budget.deadline,
+        max_entries,
+    )
+    return run_budgeted(
+        _scan_tree_worker,
+        lambda partials, warnings: _partial_tree(root, partials, warnings),
+        budget,
+        args=args,
+    )
+
+
+def _scan_tree_worker(
+    session,
+    root_path: str,
+    max_depth: int | None,
+    exclude_dirs: set[str] | None,
+    current_depth: int,
+    max_seconds: float | None,
+    deadline: float | None,
+    max_entries: int | None,
+) -> dict:
+    """Run one scan, inside the caller's process or a killable worker."""
+    budget = _worker_budget(session, max_seconds, deadline, max_entries)
+    tree = _scan_node(
+        Path(root_path), (), current_depth, budget, max_depth, exclude_dirs
+    )
+    return {"tree": tree, "warnings": budget.warnings, "truncated": budget.truncated}
+
+
+def _partial_tree(root: Path, partials: list[dict], warnings: list[str]) -> dict:
+    """Rebuild the tree a killed scan had streamed so far."""
+    nodes: dict[tuple[str, ...], dict] = {
+        (): {"name": root.name or str(root), "type": "directory", "children": []}
+    }
+    for payload in partials:
+        if payload.get("kind") != "entry":
+            continue
+        parts = tuple(payload.get("parts") or ())
+        if not parts:
+            continue
+        kind = payload.get("type")
+        node: dict = {"name": parts[-1]}
+        if kind == "file":
+            node["type"] = "file"
+        elif kind == "symlink":
+            node["type"] = "symlink"
+            node["target"] = payload.get("target") or ""
+        elif kind == "directory":
+            node["type"] = "directory"
+            node["children"] = []
+        else:
+            node["type"] = "unknown"
+        nodes[parts] = node
+        parent = nodes.get(parts[:-1])
+        if parent is not None:
+            children = parent.setdefault("children", [])
+            if node not in children:
+                children.append(node)
+    return {"tree": nodes[()], "warnings": list(warnings), "truncated": None}
 
 
 def _scan_node(
     path: Path,
-    max_depth: int | None,
+    parts: tuple[str, ...],
     current_depth: int,
-    warnings: list[str],
+    budget: Budget,
+    max_depth: int | None,
     exclude_dirs: set[str] | None = None,
 ) -> dict:
     """Recursively scan a single path node."""
     name = path.name or str(path)
 
-    # Symlink — record but do not follow
-    if path.is_symlink():
-        return {"name": name, "type": "symlink", "target": str(path.resolve())}
+    try:
+        kind = _classify(path)
+    except OSError as exc:
+        budget.warn(f"Error reading {path}: {fsscan.error_detail(exc)}")
+        return {"name": name, "type": "unknown"}
 
-    # File
-    if path.is_file():
+    # Symlink — record but do not follow
+    if kind == "symlink":
+        return {"name": name, "type": "symlink", "target": _link_target(path, budget)}
+
+    if kind == "file":
         return {"name": name, "type": "file"}
 
-    # Directory
-    if path.is_dir():
-        # Check depth limit
-        if max_depth is not None and current_depth >= max_depth:
-            return {"name": name, "type": "directory", "children": []}
+    if kind != "directory":
+        return {"name": name, "type": "unknown"}
 
-        children: list[dict] = []
-        effective_exclude = exclude_dirs if exclude_dirs is not None else DEFAULT_EXCLUDED_DIRS
+    # Check depth limit, then the budget before touching the filesystem again
+    if max_depth is not None and current_depth >= max_depth:
+        return {"name": name, "type": "directory", "children": []}
+    if budget.truncated is not None:
+        return {"name": name, "type": "directory", "children": []}
+
+    try:
+        entries = _list_dir(path)
+    except OSError as exc:
+        budget.warn(f"Error reading {path}: {fsscan.error_detail(exc)}")
+        return {"name": name, "type": "directory", "children": []}
+
+    effective_exclude = exclude_dirs if exclude_dirs is not None else DEFAULT_EXCLUDED_DIRS
+    children: list[dict] = []
+    for entry in entries:
         try:
-            entries = sorted(path.iterdir(), key=lambda p: p.name)
-        except PermissionError as exc:
-            warnings.append(f"Permission denied: {path} — {exc}")
-            return {"name": name, "type": "directory", "children": []}
+            child_kind = _classify(entry)
+        except OSError as exc:
+            budget.warn(f"Error reading {entry}: {fsscan.error_detail(exc)}")
+            continue
 
-        for entry in entries:
-            # Skip excluded directories
-            if entry.is_dir() and not entry.is_symlink() and entry.name in effective_exclude:
-                continue
-            try:
-                child = _scan_node(entry, max_depth, current_depth + 1, warnings, exclude_dirs)
-                children.append(child)
-            except PermissionError as exc:
-                warnings.append(f"Permission denied: {entry} — {exc}")
-            except OSError as exc:
-                warnings.append(f"Error reading {entry} — {exc}")
+        # Skip excluded directories
+        if child_kind == "directory" and entry.name in effective_exclude:
+            continue
 
-        return {"name": name, "type": "directory", "children": children}
+        child_parts = parts + (entry.name,)
+        streamed = {
+            "kind": "entry",
+            "parts": list(child_parts),
+            "type": child_kind,
+            "target": _link_target(entry, budget) if child_kind == "symlink" else None,
+        }
+        keep_going = budget.count_entry(streamed)
+        children.append(
+            _scan_node(entry, child_parts, current_depth + 1, budget, max_depth, exclude_dirs)
+        )
+        if not keep_going:
+            # The entry that reached the cap is recorded, then the scan stops.
+            break
 
-    return {"name": name, "type": "unknown"}
+    return {"name": name, "type": "directory", "children": children}
 
 
-def search_files(path: Path, file_type: str, exclude_dirs: set[str] | None = None) -> list[dict]:
+def search_files(
+    path: Path,
+    file_type: str,
+    exclude_dirs: set[str] | None = None,
+    budget: Budget | None = None,
+) -> list[dict]:
     """Return a flat list of files matching the given extension under path.
 
     Args:
         path: Root directory to search.
         file_type: File extension to filter by (e.g. 'jpg', 'png').
         exclude_dirs: Set of directory names to exclude. None uses defaults.
+        budget: Budget bounding the walk, whose ``warnings`` collect errors.
 
     Returns:
         List of dicts with keys: name, path, size.
@@ -155,28 +350,75 @@ def search_files(path: Path, file_type: str, exclude_dirs: set[str] | None = Non
     Raises:
         FileNotFoundError: If path does not exist.
     """
-    if not path.exists():
-        raise FileNotFoundError(f"Path not found: {path}")
+    if budget is None:
+        budget = Budget()
+
+    try:
+        if fsscan.path_kind(path) != "directory":
+            return []
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(fsscan.fs_error(path, exc)) from exc
 
     ext = file_type.lower().lstrip(".")
     results: list[dict] = []
 
-    for entry in walk_directory(path, exclude_dirs=exclude_dirs):
+    for entry in walk_directory(path, exclude_dirs=exclude_dirs, budget=budget):
         if entry.suffix.lower().lstrip(".") == ext:
             try:
                 stat = entry.stat()
-                results.append(
-                    {
-                        "name": entry.name,
-                        "path": str(entry),
-                        "size": stat.st_size,
-                    }
-                )
-            except (PermissionError, OSError):
-                # Skip files we can't stat
+            except OSError as exc:
+                budget.warn(f"Error reading {entry}: {fsscan.error_detail(exc)}")
                 continue
+            item = {
+                "name": entry.name,
+                "path": str(entry),
+                "size": stat.st_size,
+            }
+            results.append(item)
+            budget.emit({"kind": "item", "item": item})
 
     return sorted(results, key=lambda f: f["name"])
+
+
+def search_files_budgeted(
+    path: Path,
+    file_type: str,
+    exclude_dirs: set[str] | None = None,
+    max_seconds: float | None = None,
+    max_entries: int | None = None,
+) -> dict:
+    """Search by extension under a budget.
+
+    Returns a dict with ``results``, ``warnings`` and ``truncated``.
+    """
+    root = Path(path)
+    max_seconds, max_entries = resolve_budget(root, max_seconds, max_entries)
+    budget = Budget(max_seconds=max_seconds, max_entries=max_entries)
+    args = (str(root), file_type, exclude_dirs, max_seconds, budget.deadline, max_entries)
+    return run_budgeted(_search_worker, _assemble_search, budget, args=args)
+
+
+def _search_worker(
+    session,
+    root_path: str,
+    file_type: str,
+    exclude_dirs: set[str] | None,
+    max_seconds: float | None,
+    deadline: float | None,
+    max_entries: int | None,
+) -> dict:
+    budget = _worker_budget(session, max_seconds, deadline, max_entries)
+    results = search_files(Path(root_path), file_type, exclude_dirs, budget=budget)
+    return {"results": results, "warnings": budget.warnings, "truncated": budget.truncated}
+
+
+def _assemble_search(partials: list[dict], warnings: list[str]) -> dict:
+    items = [
+        payload["item"]
+        for payload in partials
+        if payload.get("kind") == "item" and "item" in payload
+    ]
+    return {"results": items, "warnings": list(warnings), "truncated": None}
 
 
 def find_patterns(
@@ -184,6 +426,7 @@ def find_patterns(
     exclude_dirs: set[str] | None = None,
     strategy: str = "auto",
     min_group_size: int = 3,
+    budget: Budget | None = None,
 ) -> list[dict]:
     """Detect naming patterns across files in a directory tree.
 
@@ -199,13 +442,18 @@ def find_patterns(
         exclude_dirs: Set of directory names to exclude. None uses defaults.
         strategy: Detection strategy to use.
         min_group_size: Minimum number of files to form a pattern group.
+        budget: Budget bounding the walk, whose ``warnings`` collect errors.
 
     Returns:
         List of dicts, each with keys: type, pattern, files (sorted).
     """
-    import re
+    if budget is None:
+        budget = Budget()
 
-    if not path.is_dir():
+    try:
+        if fsscan.path_kind(path) != "directory":
+            return []
+    except FileNotFoundError:
         return []
 
     valid_strategies = {"auto", "sequence", "prefix", "suffix", "date"}
@@ -214,13 +462,22 @@ def find_patterns(
 
     # Collect all filenames (stems and full paths)
     file_entries: list[tuple[str, str]] = []  # (stem, full_path)
-    for fpath in walk_directory(path, exclude_dirs=exclude_dirs):
+    for fpath in walk_directory(path, exclude_dirs=exclude_dirs, budget=budget):
         try:
             _ = fpath.stat()
-        except (PermissionError, OSError):
+        except OSError as exc:
+            budget.warn(f"Error reading {fpath}: {fsscan.error_detail(exc)}")
             continue
         file_entries.append((fpath.stem, str(fpath)))
+        budget.emit({"kind": "file", "path": str(fpath)})
 
+    return _detect_patterns(file_entries, strategy, min_group_size)
+
+
+def _detect_patterns(
+    file_entries: list[tuple[str, str]], strategy: str, min_group_size: int
+) -> list[dict]:
+    """Run the requested detection strategies over a file list."""
     if not file_entries:
         return []
 
@@ -408,6 +665,7 @@ def find_duplicates(
     exclude_dirs: set[str] | None = None,
     hash_algo: str = "sha256",
     min_size: int = 0,
+    budget: Budget | None = None,
 ) -> list[dict]:
     """Find duplicate files by content hash.
 
@@ -419,12 +677,19 @@ def find_duplicates(
         exclude_dirs: Set of directory names to exclude. None uses defaults.
         hash_algo: Hash algorithm name (must be valid for hashlib).
         min_size: Minimum file size in bytes to consider.
+        budget: Budget bounding the walk, whose ``warnings`` collect errors.
 
     Returns:
         List of dicts, each with keys: hash, size, files (sorted list of
         file path strings). Only groups with 2+ files are returned.
     """
-    if not path.is_dir():
+    if budget is None:
+        budget = Budget()
+
+    try:
+        if fsscan.path_kind(path) != "directory":
+            return []
+    except FileNotFoundError:
         return []
 
     try:
@@ -436,10 +701,11 @@ def find_duplicates(
 
     # Pass 1: group files by size
     size_groups: dict[int, list[Path]] = defaultdict(list)
-    for fpath in walk_directory(path, exclude_dirs=exclude_dirs):
+    for fpath in walk_directory(path, exclude_dirs=exclude_dirs, budget=budget):
         try:
             size = fpath.stat().st_size
-        except (PermissionError, OSError):
+        except OSError as exc:
+            budget.warn(f"Error reading {fpath}: {fsscan.error_detail(exc)}")
             continue
         if size < min_size:
             continue
@@ -457,20 +723,154 @@ def find_duplicates(
                 file_hash = _hash_file(fpath, hash_algo)
                 key = (size, file_hash)
                 hash_groups[key].append(str(fpath))
-            except (PermissionError, OSError):
+            except OSError as exc:
+                budget.warn(f"Error reading {fpath}: {fsscan.error_detail(exc)}")
                 continue
 
     # Build result: only groups with 2+ files
     results = []
     for (size, file_hash), files in sorted(hash_groups.items()):
         if len(files) >= 2:
-            results.append({
+            group = {
                 "hash": file_hash,
                 "size": size,
                 "files": sorted(files),
-            })
+            }
+            results.append(group)
+            budget.emit({"kind": "group", "group": group})
 
     return results
+
+
+def find_duplicates_budgeted(
+    path: Path,
+    exclude_dirs: set[str] | None = None,
+    hash_algo: str = "sha256",
+    min_size: int = 0,
+    max_seconds: float | None = None,
+    max_entries: int | None = None,
+) -> dict:
+    """Find duplicates under a budget.
+
+    Returns a dict with ``duplicates``, ``warnings`` and ``truncated``.
+    """
+    root = Path(path)
+    max_seconds, max_entries = resolve_budget(root, max_seconds, max_entries)
+    budget = Budget(max_seconds=max_seconds, max_entries=max_entries)
+    args = (
+        str(root),
+        exclude_dirs,
+        hash_algo,
+        min_size,
+        max_seconds,
+        budget.deadline,
+        max_entries,
+    )
+    return run_budgeted(_duplicates_worker, _assemble_duplicates, budget, args=args)
+
+
+def _duplicates_worker(
+    session,
+    root_path: str,
+    exclude_dirs: set[str] | None,
+    hash_algo: str,
+    min_size: int,
+    max_seconds: float | None,
+    deadline: float | None,
+    max_entries: int | None,
+) -> dict:
+    budget = _worker_budget(session, max_seconds, deadline, max_entries)
+    duplicates = find_duplicates(
+        Path(root_path),
+        exclude_dirs=exclude_dirs,
+        hash_algo=hash_algo,
+        min_size=min_size,
+        budget=budget,
+    )
+    return {
+        "duplicates": duplicates,
+        "warnings": budget.warnings,
+        "truncated": budget.truncated,
+    }
+
+
+def _assemble_duplicates(partials: list[dict], warnings: list[str]) -> dict:
+    groups = [
+        payload["group"]
+        for payload in partials
+        if payload.get("kind") == "group" and "group" in payload
+    ]
+    return {"duplicates": groups, "warnings": list(warnings), "truncated": None}
+
+
+def find_patterns_budgeted(
+    path: Path,
+    exclude_dirs: set[str] | None = None,
+    strategy: str = "auto",
+    min_group_size: int = 3,
+    max_seconds: float | None = None,
+    max_entries: int | None = None,
+) -> dict:
+    """Detect naming patterns under a budget.
+
+    Returns a dict with ``patterns``, ``warnings`` and ``truncated``.
+    """
+    root = Path(path)
+    max_seconds, max_entries = resolve_budget(root, max_seconds, max_entries)
+    budget = Budget(max_seconds=max_seconds, max_entries=max_entries)
+    args = (
+        str(root),
+        exclude_dirs,
+        strategy,
+        min_group_size,
+        max_seconds,
+        budget.deadline,
+        max_entries,
+    )
+    def _assemble(partials: list[dict], warnings: list[str]) -> dict:
+        return _assemble_patterns(partials, warnings, strategy, min_group_size)
+
+    return run_budgeted(_patterns_worker, _assemble, budget, args=args)
+
+
+def _patterns_worker(
+    session,
+    root_path: str,
+    exclude_dirs: set[str] | None,
+    strategy: str,
+    min_group_size: int,
+    max_seconds: float | None,
+    deadline: float | None,
+    max_entries: int | None,
+) -> dict:
+    budget = _worker_budget(session, max_seconds, deadline, max_entries)
+    patterns = find_patterns(
+        Path(root_path),
+        exclude_dirs=exclude_dirs,
+        strategy=strategy,
+        min_group_size=min_group_size,
+        budget=budget,
+    )
+    return {"patterns": patterns, "warnings": budget.warnings, "truncated": budget.truncated}
+
+
+def _assemble_patterns(
+    partials: list[dict],
+    warnings: list[str],
+    strategy: str,
+    min_group_size: int,
+) -> dict:
+    paths = [
+        payload["path"]
+        for payload in partials
+        if payload.get("kind") == "file" and payload.get("path")
+    ]
+    entries = [(Path(path).stem, path) for path in paths]
+    return {
+        "patterns": _detect_patterns(entries, strategy, min_group_size),
+        "warnings": list(warnings),
+        "truncated": None,
+    }
 
 
 def _hash_file(path: Path, algo: str) -> str:
@@ -494,11 +894,14 @@ def file_info(path: Path) -> dict:
     Raises:
         FileNotFoundError: If path does not exist.
         IsADirectoryError: If path is a directory.
+        OSError: For any other filesystem failure, with its real errno.
     """
-    if not path.exists():
-        raise FileNotFoundError(f"Path not found: {path}")
+    try:
+        kind = fsscan.path_kind(path)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(fsscan.fs_error(path, exc)) from exc
 
-    if path.is_dir():
+    if kind == "directory":
         raise IsADirectoryError(f"Expected a file, got a directory: {path}")
 
     stat = path.stat()
