@@ -348,3 +348,59 @@ class TestTruncatedResultIsNotCached:
         assert [child["name"] for child in second["tree"]["children"]] == ["b.txt"]
         assert second["truncated"] is None
         assert cache_stats(tmp_path)["entries"] == 1
+
+
+class TestFailedScanIsNotCached:
+    """A scan that FAILED is not a scan that found nothing.
+
+    When the worker crashes, is killed by the OOM killer, or dies on EOF, the
+    body carries `error` with `truncated: None`. Persisting that body stores an
+    empty file set, and an empty recorded set is treated as "always fresh" — so
+    the failed scan would be replayed forever instead of retried.
+    """
+
+    def test_worker_error_leaves_no_entry_and_the_next_call_rescans(
+        self, tmp_path: Path
+    ) -> None:
+        init_db(tmp_path)
+        (tmp_path / "a.txt").write_text("hello")
+        scans: list[str] = []
+
+        def failing_scan() -> dict:
+            scans.append("failed")
+            return {
+                "tree": {
+                    "name": tmp_path.name,
+                    "type": "directory",
+                    "children": [],
+                },
+                "warnings": [],
+                "truncated": None,
+                "error": "Scan worker exited without a result",
+            }
+
+        first = get_or_scan(tmp_path, "scan_directory", str(tmp_path), failing_scan)
+
+        assert first["error"] == "Scan worker exited without a result"
+        key = make_cache_key("scan_directory", str(tmp_path))
+        assert get_cache(tmp_path, key) is None
+        assert cache_stats(tmp_path)["entries"] == 0
+        assert check_freshness(tmp_path, key) is False
+
+        def recovered_scan() -> dict:
+            scans.append("recovered")
+            return {
+                "tree": {
+                    "name": tmp_path.name,
+                    "type": "directory",
+                    "children": [{"name": "a.txt", "type": "file"}],
+                },
+                "warnings": [],
+                "truncated": None,
+            }
+
+        second = get_or_scan(tmp_path, "scan_directory", str(tmp_path), recovered_scan)
+
+        assert scans == ["failed", "recovered"]
+        assert [child["name"] for child in second["tree"]["children"]] == ["a.txt"]
+        assert cache_stats(tmp_path)["entries"] == 1

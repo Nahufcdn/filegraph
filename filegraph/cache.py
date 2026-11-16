@@ -256,9 +256,13 @@ def get_or_scan(
     # Cache miss or stale — scan live
     result = scan_fn()
 
-    if result.get("truncated") is not None:
-        # A partial answer is worse than re-scanning, and it must never be
-        # served later as if it were complete.
+    # A partial or a failed answer is worse than re-scanning, and neither may
+    # ever be served later as if it were complete. A failed scan is not an
+    # empty directory: the worker-failure body carries `error` with
+    # `truncated: None`, and caching it records an empty file set, which
+    # freshness treats as "always fresh" — the failure would then be replayed
+    # on every later call instead of being retried.
+    if result.get("truncated") is not None or result.get("error"):
         return result
 
     # Extract file set and store
