@@ -374,6 +374,73 @@ y la verificación de frescura de un root de red usa el mismo presupuesto: si no
 puede completarse, la entrada se considera vieja y se re-escanea (acotado). Una
 raíz local mantiene el caché en `<ruta>/.filegraph/cache.db`, sin cambios.
 
+## Árbol indexado (import / export)
+
+Cuando el árbol es demasiado grande para escanearlo por el mount, `filegraph` lo **importa** de un
+listado y consulta el índice local. El índice es un SQLite por raíz en
+`$XDG_CACHE_HOME/filegraph/<sha256 de la raíz>/index.db`, fuera del árbol indexado.
+
+```bash
+# 1. listado generado donde viven los datos (una sola pasada de metadata)
+find /ruta/al/arbol -printf '%y\t%s\t%T@\t%p\n' | gzip > arbol.tsv.gz
+
+# 2. import (acepta archivo o stdin; re-importar reemplaza el índice)
+filegraph import --root /ruta/local --format tsv <(zcat arbol.tsv.gz)
+
+# 3. consultas: salen del índice, sin tocar el filesystem
+filegraph export --root /ruta/local --format tsv
+filegraph status --root /ruta/local
+```
+
+Un root indexado **nunca** se `stat`ea, ni se recorre, ni se escribe: las tools
+(`scan_directory`, `search_by_type`, `find_patterns`, `find_duplicates`) y `cache_status` responden
+desde el índice e informan `"source": "index"`. El TSV que exportás es re-importable tal cual.
+
+Límites conocidos: `find_duplicates` sobre índice agrupa **por tamaño** (`hash: null`,
+`content_hashed: false`) porque hashear exige leer contenido; los symlinks pierden el target (el TSV
+de 4 columnas no lo trae); y `export` es un dump fiel, sin exclusiones por defecto.
+
+### Ingesta por SSH
+
+Si el árbol vive en un servidor y el mount local no sirve para transferir, `filegraph pull` trae el
+listado por SSH y lo importa para la **ruta del mount local** que después consultás:
+
+```bash
+filegraph sources add nas \
+  --host 10.0.0.114 --user filegraph --key /ruta/a/la/clave \
+  --remote-path /mnt/pool/escaneos \
+  --local-path /home/usuario/mnt/escaneos
+
+filegraph pull --source nas            # stream find → import
+filegraph sources list                 # nunca muestra material de la clave
+```
+
+Cada fila se mapea de `remote-path` a `local-path`; una fila fuera del prefijo remoto aborta el pull y
+**deja intacto el índice anterior**, igual que un stream cortado.
+
+**Modelo de seguridad.** No se usa shell en el servidor: la clave del cliente se restringe en
+`authorized_keys` a un único comando de solo lectura.
+
+```bash
+#!/bin/sh
+# /mnt/pool/scripts/filegraph-find  — único comando permitido a la clave
+set -eu
+case "${1:-}" in
+  /mnt/*) ;;
+  *) echo "path not allowed" >&2; exit 2 ;;
+esac
+exec find "$1" -printf '%y\t%s\t%T@\t%p\n'
+```
+
+```
+# ~/.ssh/authorized_keys del usuario de solo lectura
+restrict,command="/mnt/pool/scripts/filegraph-find" ssh-ed25519 AAAA… filegraph@pc
+```
+
+`restrict` desactiva pty, forwarding, agent y X11: esa clave solo puede ejecutar el wrapper. Si el
+wrapper no acepta la ruta como argumento, fijá el dataset dentro del script y configurá la fuente con
+`--remote-command` apuntando al wrapper. `filegraph` nunca lee ni imprime el contenido de la clave.
+
 ## CLI
 
 El proyecto incluye un comando `filegraph` que se instala automáticamente:
