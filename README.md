@@ -177,6 +177,8 @@ Escanea un directorio y devuelve su jerarquía como árbol JSON.
 | `max_depth` | int | ❌ | Profundidad máxima (None = sin límite) |
 | `exclude_dirs` | list[str] | ❌ | Directorios a excluir |
 | `include_excluded` | bool | ❌ | Incluir directorios excluidos por defecto |
+| `max_seconds` | float | ❌ | Presupuesto de tiempo (ver [Mounts de red](#mounts-de-red)) |
+| `max_entries` | int | ❌ | Tope de entradas (ver [Mounts de red](#mounts-de-red)) |
 
 **Ejemplo:**
 
@@ -190,9 +192,15 @@ Escanea un directorio y devuelve su jerarquía como árbol JSON.
       {"type": "file", "name": "icon.png", "size": 47672}
     ]
   },
-  "warnings": []
+  "warnings": [],
+  "truncated": null
 }
 ```
+
+`truncated` es `null` cuando el escaneo cubrió todo el árbol. Si el presupuesto lo
+cortó, trae `{"reason", "limit", "entries_seen"}` con `reason` en `time_budget` o
+`entry_budget`: el árbol devuelto es parcial y está dicho, nunca presentado como
+si estuviera completo.
 
 ### `search_by_type`
 
@@ -330,6 +338,41 @@ Elimina un directorio del caché.
 - **Unicode**: Los nombres de archivos Unicode se preservan exactamente
 - **Exclusiones por defecto**: `.git`, `node_modules`, `__pycache__`, `.venv` se excluyen automáticamente
 - **Personalización**: Usa `--no-exclude` en CLI o `include_excluded=True` en tools para incluir directorios excluidos
+- **Errores del filesystem**: Se informan con la ruta y el `errno`
+  (`No such file or directory (errno 2): /ruta`), nunca como "no encontrado".
+  `pathlib` devuelve `False` para EACCES/ESTALE/ENOTCONN/EIO, y ese silencio es
+  lo que hacía que un mount caído se viera como un directorio vacío.
+
+### Mounts de red
+
+Un escaneo sobre un filesystem de red (CIFS/SMB, NFS, sshfs, 9p, AFS) es
+**acotado por defecto**:
+
+| Presupuesto | Valor por defecto |
+|-------------|-------------------|
+| `max_seconds` | `45` |
+| `max_entries` | `200000` |
+
+La raíz escaneada se clasifica leyendo `/proc/self/mountinfo` con un
+longest-prefix match. Si no se puede determinar el filesystem (no-Linux, sin
+mountinfo, error de parseo), se trata como **local**: un entorno desconocido
+nunca se trunca en silencio.
+
+En un filesystem local no cambia nada: `max_depth` sigue en `None`, sin deadline
+y sin tope de entradas.
+
+El deadline se cumple de verdad: el recorrido corre en un proceso hijo que se
+mata al vencer el presupuesto, y las entradas descubiertas se streamean al padre.
+Un chequeo cooperativo en Python no puede interrumpir un `scandir`/`stat`
+bloqueado en el kernel.
+
+El caché también se mueve: para una raíz de red la base vive fuera del share,
+en `$XDG_CACHE_HOME/filegraph/<sha256 de la ruta resuelta>/cache.db` (o
+`~/.cache/filegraph/…`), así que escanear un mount **no escribe nada** en él: ni
+`.filegraph/`, ni `.db`, ni `-wal`/`-shm`. Un resultado truncado no se persiste,
+y la verificación de frescura de un root de red usa el mismo presupuesto: si no
+puede completarse, la entrada se considera vieja y se re-escanea (acotado). Una
+raíz local mantiene el caché en `<ruta>/.filegraph/cache.db`, sin cambios.
 
 ## CLI
 
