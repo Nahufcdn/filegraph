@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from filegraph import fsscan, store
+from filegraph.cache import make_cache_key
 from filegraph.store import (
     cache_stats,
     get_cache,
@@ -17,6 +21,7 @@ from filegraph.store import (
     search_fts,
     set_cache,
 )
+from filegraph.tools import scan_directory
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +260,110 @@ class TestCacheStats:
         stats = cache_stats(tmp_path)
         assert stats["entries"] == 2
         assert stats["total_files"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Cache location: outside the share for network roots (S9), unchanged locally (S10)
+# ---------------------------------------------------------------------------
+
+
+def _fake_mountinfo(base: Path, mount_point: Path, fstype: str) -> Path:
+    """Write a mountinfo file that maps ``mount_point`` to ``fstype``."""
+    info = base / "mountinfo"
+    info.write_text(
+        f"36 35 0:31 / {Path(mount_point).resolve()} rw,relatime shared:1 - "
+        f"{fstype} //server/share rw\n",
+        encoding="utf-8",
+    )
+    return info
+
+
+def _expected_local_db(cache_root: Path, scanned: Path) -> Path:
+    """The database path a network root must resolve to."""
+    resolved = os.path.realpath(os.fspath(scanned))
+    digest = hashlib.sha256(resolved.encode()).hexdigest()
+    return cache_root / "filegraph" / digest / "cache.db"
+
+
+def _share_files(root: Path) -> list[str]:
+    """Every path under ``root``, so "nothing was written" is checkable."""
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+class TestNetworkRootCacheLocation:
+    """S9: a network root is cached locally, never inside the scanned tree."""
+
+    def test_network_root_database_is_local_and_nothing_lands_in_the_share(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        share = tmp_path / "share"
+        share.mkdir()
+        monkeypatch.setattr(
+            fsscan, "MOUNTINFO_PATH", _fake_mountinfo(tmp_path, share, "cifs")
+        )
+        xdg = tmp_path / "xdg-cache"
+        monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
+        (share / "a.txt").write_text("hello")
+        before = _share_files(share)
+
+        result = scan_directory(str(share))
+
+        assert result["tree"]["name"] == "share"
+        expected_db = _expected_local_db(xdg, share)
+        assert store._get_db_path(share) == expected_db
+        assert expected_db.exists()
+        assert cache_stats(share)["entries"] == 1
+        # Nothing at all was added to the share: no .filegraph/, no db, no WAL.
+        assert _share_files(share) == before
+        assert not (share / ".filegraph").exists()
+        assert [p for p in share.rglob("*") if p.suffix in {".db", ".db-wal", ".db-shm"}] == []
+
+    def test_falls_back_to_home_cache_when_xdg_cache_home_is_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        share = tmp_path / "share"
+        share.mkdir()
+        monkeypatch.setattr(
+            fsscan, "MOUNTINFO_PATH", _fake_mountinfo(tmp_path, share, "nfs")
+        )
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(home))
+
+        init_db(share)
+        set_cache(share, "k1", "t", str(share), json.dumps({}), [])
+
+        expected_db = _expected_local_db(home / ".cache", share)
+        assert store._get_db_path(share) == expected_db
+        assert expected_db.exists()
+        assert get_cache(share, "k1") is not None
+        assert _share_files(share) == []
+
+
+class TestLocalRootCacheLocation:
+    """S10: a local root keeps today's location, schema, keys and freshness."""
+
+    def test_local_root_keeps_the_in_tree_database_and_keys(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        xdg = tmp_path / "xdg-cache"
+        monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
+        root = tmp_path / "project"
+        root.mkdir()
+        (root / "a.txt").write_text("hello")
+
+        assert store._get_db_path(root) == root / ".filegraph" / "cache.db"
+
+        result = scan_directory(str(root))
+
+        assert result["tree"]["name"] == "project"
+        assert (root / ".filegraph" / "cache.db").exists()
+        assert not xdg.exists()
+        # The key is unchanged: an unbudgeted local scan adds no key options.
+        entry = get_cache(root, make_cache_key("scan_directory", str(root)))
+        assert entry is not None
+        assert entry["path"] == str(root)
 
 
 class TestSchemaRecovery:

@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from filegraph.scanbudget import resolve_budget, run_worker
 from filegraph.store import get_cache as _store_get, get_file_set, set_cache as _store_set
 
 
@@ -116,7 +117,9 @@ def _walk_tree(node: dict, add_file: Callable[[str], None], base_path: str = "")
             _walk_tree(child, add_file, base_path=dir_path)
 
 
-def check_freshness(project_root: Path, cache_key: str) -> bool:
+def check_freshness(
+    project_root: Path, cache_key: str, max_seconds: float | None = None
+) -> bool:
     """Check whether a cached result is still fresh.
 
     Freshness rules:
@@ -124,9 +127,16 @@ def check_freshness(project_root: Path, cache_key: str) -> bool:
     2. If any recorded file is missing → stale (deleted)
     3. If current file set differs from recorded set → stale (new files)
 
+    On a network filesystem the check is bounded by the scan budget: a walk
+    that cannot finish inside it counts as stale, never as fresh, so a stuck
+    mount cannot hang the second call where the first one returned.
+
     Args:
         project_root: Project root path.
         cache_key: Cache key to validate.
+        max_seconds: Freshness budget. None resolves the default for the
+            filesystem kind: the network scan default on a network root, no
+            bound at all on a local one.
 
     Returns:
         True if fresh, False if stale.
@@ -135,13 +145,22 @@ def check_freshness(project_root: Path, cache_key: str) -> bool:
     if entry is None:
         return False
 
-    max_mtime = entry["max_mtime"]
-
     # Load recorded file set
     recorded_files = get_file_set(project_root, cache_key)
     if not recorded_files:
         # No files recorded — empty result, always fresh
         return True
+
+    if max_seconds is None:
+        max_seconds, _ = resolve_budget(project_root)
+    if max_seconds is None:
+        return _files_unchanged(entry, recorded_files)
+    return _bounded_freshness(entry, recorded_files, max_seconds)
+
+
+def _files_unchanged(entry: dict, recorded_files: list[dict]) -> bool:
+    """Return True when the recorded manifest still matches the filesystem."""
+    max_mtime = entry["max_mtime"]
 
     # Check for deleted files and mtime changes
     recorded_set: set[str] = set()
@@ -181,6 +200,29 @@ def check_freshness(project_root: Path, cache_key: str) -> bool:
     return True
 
 
+def _freshness_worker(_session, entry: dict, recorded_files: list[dict]) -> dict:
+    """Child-process body: establish freshness for one cache entry."""
+    return {"fresh": _files_unchanged(entry, recorded_files)}
+
+
+def _bounded_freshness(
+    entry: dict, recorded_files: list[dict], max_seconds: float
+) -> bool:
+    """Establish freshness within ``max_seconds``; anything else means stale.
+
+    The probe runs in a killable process because the walk calls ``stat`` on the
+    share, and one blocked syscall cannot be interrupted from Python. A probe
+    that is stopped by the deadline, crashes, or returns nothing is treated as
+    stale: never report fresh on missing evidence.
+    """
+    outcome = run_worker(
+        _freshness_worker, (entry, recorded_files), timeout=max_seconds
+    )
+    if outcome.result is None:
+        return False
+    return bool(outcome.result.get("fresh"))
+
+
 def get_or_scan(
     project_root: Path,
     tool_name: str,
@@ -198,7 +240,9 @@ def get_or_scan(
         **kwargs: Additional options for cache key generation.
 
     Returns:
-        The scan result dict (from cache or fresh scan).
+        The scan result dict (from cache or fresh scan). A result carrying a
+        ``truncated`` marker is never stored: a retry gets a new bounded scan
+        instead of a cached partial tree.
     """
     cache_key = make_cache_key(tool_name, path, **kwargs)
 
@@ -211,6 +255,11 @@ def get_or_scan(
 
     # Cache miss or stale — scan live
     result = scan_fn()
+
+    if result.get("truncated") is not None:
+        # A partial answer is worse than re-scanning, and it must never be
+        # served later as if it were complete.
+        return result
 
     # Extract file set and store
     file_set = extract_file_set(result, tool_name)

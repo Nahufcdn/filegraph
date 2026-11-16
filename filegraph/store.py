@@ -1,19 +1,62 @@
-"""SQLite cache store for scan results."""
+"""SQLite cache store for scan results.
+
+Where the database lives depends on the scanned root: a local root keeps
+``<scanned>/.filegraph/cache.db``, while a root on a network filesystem keeps it
+in the local cache directory, keyed by the resolved scanned path. Scanning a
+CIFS/NFS share must never create ``.filegraph/``, a database, or WAL files on
+the share.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
 
+from filegraph import fsscan
+
 _DB_NAME = "cache.db"
 _DB_DIR = ".filegraph"
 
+#: Directory name appended to the local cache base for network-root databases.
+_CACHE_DIR_NAME = "filegraph"
+
+
+def local_cache_dir() -> Path:
+    """Return the local cache directory used for network roots.
+
+    ``$XDG_CACHE_HOME/filegraph`` when the variable is set and non-empty,
+    otherwise ``~/.cache/filegraph``.
+    """
+    configured = os.environ.get("XDG_CACHE_HOME")
+    base = Path(configured) if configured else Path.home() / ".cache"
+    return base / _CACHE_DIR_NAME
+
+
+def _network_db_path(project_root: Path) -> Path:
+    """Return the local database path for a network root.
+
+    Keyed by a digest of the resolved scanned path, so two different shares
+    never share a database and one share reached by two paths keeps one.
+    """
+    resolved = os.path.realpath(os.fspath(project_root))
+    digest = hashlib.sha256(resolved.encode("utf-8", "surrogateescape")).hexdigest()
+    return local_cache_dir() / digest / _DB_NAME
+
 
 def _get_db_path(project_root: Path) -> Path:
-    """Return the path to the cache database."""
-    return project_root / _DB_DIR / _DB_NAME
+    """Return the path to the cache database.
+
+    A network root stores its database outside the scanned tree, so a scan
+    writes nothing into the share. A local root is unchanged:
+    ``<scanned>/.filegraph/cache.db``.
+    """
+    if fsscan.is_network_path(project_root):
+        return _network_db_path(project_root)
+    return Path(project_root) / _DB_DIR / _DB_NAME
 
 
 # Schema is applied on demand: a cache.db that exists without its tables (an

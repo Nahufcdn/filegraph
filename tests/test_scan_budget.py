@@ -384,3 +384,43 @@ class TestWorkerParity:
         assert budgeted["truncated"] is None
         assert budgeted["tree"] == in_process["tree"]
         assert budgeted["warnings"] == in_process["warnings"]
+
+class TestNetworkFreshnessBudget:
+    def test_freshness_walk_over_budget_is_stale_and_a_live_scan_runs(
+        self, network_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (network_root / "a.txt").write_text("x")
+        monkeypatch.setattr(scanbudget, "NETWORK_DEFAULT_MAX_SECONDS", 1.0)
+
+        first = _tool("scan", network_root)
+        assert first["truncated"] is None
+
+        (network_root / "b.txt").write_text("y")
+        _block_walk(monkeypatch, seconds=10)
+
+        started = time.monotonic()
+        second = _tool("scan", network_root)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, f"freshness walk ran {elapsed:.1f}s past its 1.0s budget"
+        # The entry was treated as stale: the live bounded scan ran and saw b.txt
+        assert _child_names(second["tree"]) == {"a.txt", "b.txt"}
+        assert second["truncated"] is None
+
+    def test_a_freshness_walk_inside_the_budget_still_serves_the_cache(
+        self, network_root: Path
+    ) -> None:
+        from filegraph.cache import check_freshness
+        from filegraph.store import list_entries_by_path
+
+        (network_root / "a.txt").write_text("x")
+        assert _tool("scan", network_root)["truncated"] is None
+
+        entries = list_entries_by_path(network_root, str(network_root))
+        assert len(entries) == 1
+        assert check_freshness(network_root, entries[0]["cache_key"]) is True
+
+
+# ---------------------------------------------------------------------------
+# PRESERVE: the killable-worker path returns the same complete tree
+# ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from filegraph.cache import check_freshness, extract_file_set, get_or_scan, make_cache_key
-from filegraph.store import init_db, set_cache
+from filegraph.store import cache_stats, get_cache, init_db, set_cache
 
 
 # ---------------------------------------------------------------------------
@@ -285,3 +285,66 @@ class TestGetOrScan:
         r2 = get_or_scan(tmp_path, "scan_directory", str(tmp_path), mock_scan)
         assert r1 == r2
         assert r1 == original
+
+
+# ---------------------------------------------------------------------------
+# S11: a truncated result is never persisted nor served later
+# ---------------------------------------------------------------------------
+
+
+class TestTruncatedResultIsNotCached:
+    """A partial scan leaves no cache entry, so a retry gets a live scan."""
+
+    def test_truncated_scan_leaves_no_entry_and_the_next_call_rescans(
+        self, tmp_path: Path
+    ) -> None:
+        init_db(tmp_path)
+        (tmp_path / "a.txt").write_text("hello")
+        (tmp_path / "b.txt").write_text("world")
+
+        truncation = {"reason": "entry_budget", "limit": 1, "entries_seen": 1}
+        scans: list[list[str]] = []
+
+        def _entry(name: str) -> dict:
+            return {"name": name, "type": "file"}
+
+        def truncated_scan() -> dict:
+            scans.append(["a.txt"])
+            return {
+                "tree": {
+                    "name": tmp_path.name,
+                    "type": "directory",
+                    "children": [_entry("a.txt")],
+                },
+                "warnings": [],
+                "truncated": truncation,
+            }
+
+        first = get_or_scan(tmp_path, "scan_directory", str(tmp_path), truncated_scan)
+
+        assert first["truncated"] == truncation
+        assert get_cache(tmp_path, make_cache_key("scan_directory", str(tmp_path))) is None
+        assert cache_stats(tmp_path)["entries"] == 0
+
+        # The tree changed since the partial scan: a cached partial would still
+        # report a.txt, a live scan reports b.txt only.
+        (tmp_path / "a.txt").unlink()
+
+        def complete_scan() -> dict:
+            scans.append(["b.txt"])
+            return {
+                "tree": {
+                    "name": tmp_path.name,
+                    "type": "directory",
+                    "children": [_entry("b.txt")],
+                },
+                "warnings": [],
+                "truncated": None,
+            }
+
+        second = get_or_scan(tmp_path, "scan_directory", str(tmp_path), complete_scan)
+
+        assert scans == [["a.txt"], ["b.txt"]]
+        assert [child["name"] for child in second["tree"]["children"]] == ["b.txt"]
+        assert second["truncated"] is None
+        assert cache_stats(tmp_path)["entries"] == 1
