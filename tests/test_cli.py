@@ -116,3 +116,19 @@ class TestCliNoCommand:
         """No command shows help and returns 1."""
         rc = main([])
         assert rc == 1
+
+
+class TestCliScanSource:
+    def test_scan_json_reports_a_live_scan(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """scan --format json still prints the tree, marked as a live scan."""
+        (tmp_path / "file.txt").write_text("data")
+
+        rc = main(["scan", str(tmp_path), "--format", "json"])
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        body = json.loads(captured.out)
+        assert body["source"] == "scan"
+        assert body["tree"]["name"] == tmp_path.name

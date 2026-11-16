@@ -5,8 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
+from filegraph import fsscan
+from filegraph import index as tree_index
+
+from filegraph import index as tree_index
 from filegraph.cache import check_freshness, get_or_scan, make_cache_key
 from filegraph.scanner import scan_tree, _resolve_exclusions
 from filegraph.store import cache_stats, invalidate_path, list_entries_by_path
@@ -190,8 +195,98 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import(args: argparse.Namespace) -> int:
+    """Import a tree listing as the index for --root."""
+    if args.listing == "-":
+        report = _run_import(args.root, sys.stdin, "-")
+    else:
+        try:
+            handle = open(
+                args.listing,
+                "r",
+                encoding="utf-8",
+                errors="surrogateescape",
+                newline="",
+            )
+        except OSError as exc:
+            print(
+                f"Error: cannot read listing: {fsscan.fs_error(args.listing, exc)}",
+                file=sys.stderr,
+            )
+            return 1
+        with handle:
+            report = _run_import(args.root, handle, args.listing)
+
+    if "error" in report:
+        print(f"Error: {report['error']}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Imported {report['entries']} entries for {report['root']} "
+        f"in {report['elapsed']:.3f}s"
+    )
+    print(f"entries: {report['entries']}")
+    print(f"directories: {report['directories']}")
+    print(f"files: {report['files']}")
+    print(f"symlinks: {report['symlinks']}")
+    print(f"unknown: {report['unknown']}")
+    print(f"total bytes: {report['total_bytes']}")
+    skipped = f"skipped: {report['skipped']} malformed row(s)"
+    if report["skipped_lines"]:
+        lines = ", ".join(str(number) for number in report["skipped_lines"])
+        if report["skipped"] > len(report["skipped_lines"]):
+            lines += ", ..."
+        skipped += f" at lines {lines}"
+    print(skipped)
+    print(f"index: {report['index_path']}")
+    return 0
+
+
+def _run_import(root: str, lines: Iterable[str], source_name: str) -> dict:
+    """Import ``lines``, turning an expected rejection into an error payload."""
+    try:
+        return tree_index.import_listing(root, lines, source_name=source_name)
+    except tree_index.ListingRejected as exc:
+        return {"error": str(exc)}
+    except OSError as exc:
+        return {"error": f"cannot write index: {fsscan.error_detail(exc)}"}
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export the stored tree for --root as tsv or json."""
+    try:
+        if args.format == "tsv":
+            lines = tree_index.export_tsv_lines(
+                args.root, subpath=args.path, max_depth=args.max_depth
+            )
+            if lines is None:
+                print(f"Error: no index for root: {args.root}", file=sys.stderr)
+                return 1
+            for line in lines:
+                sys.stdout.write(line)
+            return 0
+
+        tree = tree_index.export_tree(
+            args.root, subpath=args.path, max_depth=args.max_depth
+        )
+        if tree is None:
+            print(f"Error: no index for root: {args.root}", file=sys.stderr)
+            return 1
+        _print_json(tree)
+        return 0
+    except tree_index.IndexPathNotFound as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except tree_index.IndexUnreadable as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_status(args: argparse.Namespace) -> int:
-    """Show cache statistics."""
+    """Show cache statistics, or the index status for --root."""
+    if args.root is not None:
+        return _print_index_status(args.root)
+
     # Walk up from cwd to find nearest .filegraph/cache.db
     current = Path.cwd()
     while True:
@@ -211,6 +306,29 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"Cache entries: {stats['entries']}")
     print(f"Total files:   {stats['total_files']}")
     print(f"DB size:       {stats['size_bytes']} bytes")
+    return 0
+
+
+def _print_index_status(root: str) -> int:
+    """Report whether ``root`` is indexed, and what the index holds."""
+    resolved = tree_index.resolve_root(root)
+    path = tree_index.index_path(resolved)
+    try:
+        status = tree_index.index_status(resolved)
+    except tree_index.IndexUnreadable as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Indexed: {'yes' if status else 'no'}")
+    print(f"root: {resolved}")
+    if status:
+        print(f"imported: {status['imported_at']}")
+        print(f"entries: {status['entries']}")
+        print(f"directories: {status['directories']}")
+        print(f"files: {status['files']}")
+        print(f"symlinks: {status['symlinks']}")
+        print(f"unknown: {status['unknown']}")
+        print(f"total bytes: {status['total_bytes']}")
+    print(f"index: {path}")
     return 0
 
 
@@ -274,7 +392,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     # status
     status_parser = subparsers.add_parser("status", help="Show cache statistics")
+    status_parser.add_argument(
+        "--root",
+        default=None,
+        help="Report the index status of this root instead of cache statistics",
+    )
     status_parser.set_defaults(func=cmd_status)
+
+    # import
+    import_parser = subparsers.add_parser(
+        "import", help="Import a tree listing as the index for a root"
+    )
+    import_parser.add_argument(
+        "--root", required=True, help="Root path the listing describes"
+    )
+    import_parser.add_argument(
+        "--format", choices=["tsv"], default="tsv", help="Listing format"
+    )
+    import_parser.add_argument(
+        "listing", nargs="?", default="-", help="Listing file, or - for stdin"
+    )
+    import_parser.set_defaults(func=cmd_import)
+
+    # export
+    export_parser = subparsers.add_parser(
+        "export", help="Export the stored tree for a root"
+    )
+    export_parser.add_argument("--root", required=True, help="Root to export")
+    export_parser.add_argument(
+        "--format", choices=["json", "tsv"], default="json", help="Output format"
+    )
+    export_parser.add_argument(
+        "--path", default=None, help="Export only this path below the root"
+    )
+    export_parser.add_argument(
+        "--max-depth", type=int, default=None, help="Max depth from the export root"
+    )
+    export_parser.set_defaults(func=cmd_export)
 
     # unindex
     unindex_parser = subparsers.add_parser("unindex", help="Remove cache for path")

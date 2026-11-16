@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from filegraph import fsscan
+from filegraph import index as tree_index
 from filegraph.cache import check_freshness, get_or_scan
 from filegraph.scanbudget import resolve_budget
 from filegraph.scanner import (
@@ -52,6 +53,19 @@ def _budget_cache_key(
     return options
 
 
+def _index_result(query, *, empty: dict) -> dict | None:
+    """Run an index query: its result, None without an index, an error if broken.
+
+    An index that exists but cannot be read is reported instead of falling back
+    to a live scan: for a root that is indexed the mount is not to be touched,
+    and a silent fallback would block on a share nobody meant to contact.
+    """
+    try:
+        return query()
+    except tree_index.IndexUnreadable as exc:
+        return {"error": str(exc), **empty}
+
+
 def scan_directory(
     path: str,
     max_depth: int | None = None,
@@ -76,13 +90,27 @@ def scan_directory(
     Returns:
         Dict with 'tree' (nested dict), 'warnings' (list of strings) and
         'truncated' (None when complete, otherwise {"reason":
-        "time_budget"|"entry_budget", "limit", "entries_seen"}).
+        "time_budget"|"entry_budget", "limit", "entries_seen"}). A root with an
+        index is answered from it with ``"source": "index"``; a live scan
+        carries ``"source": "scan"``.
     """
+    effective_exclude = _resolve_exclusions(exclude_dirs, include_excluded)
+    served = _index_result(
+        lambda: tree_index.scan_tree(
+            path,
+            max_depth=max_depth,
+            exclude_dirs=effective_exclude,
+            max_entries=max_entries,
+        ),
+        empty={"tree": None, "warnings": []},
+    )
+    if served is not None:
+        return served
+
     target, error = _directory_target(path)
     if error is not None:
         return {"error": error, "tree": None, "warnings": []}
 
-    effective_exclude = _resolve_exclusions(exclude_dirs, include_excluded)
     max_seconds, max_entries = resolve_budget(target, max_seconds, max_entries)
 
     def _live_scan() -> dict:
@@ -104,6 +132,7 @@ def scan_directory(
         **_budget_cache_key(max_seconds, max_entries),
     )
     result.pop("_root_path", None)
+    result.setdefault("source", "scan")
     return result
 
 
@@ -131,11 +160,23 @@ def search_by_type(
         Dict with 'results' (list of file dicts), 'warnings' (list of strings)
         and 'truncated' (None when complete, otherwise the budget marker).
     """
+    effective_exclude = _resolve_exclusions(exclude_dirs, include_excluded)
+    served = _index_result(
+        lambda: tree_index.search_by_type(
+            path,
+            file_type,
+            exclude_dirs=effective_exclude,
+            max_entries=max_entries,
+        ),
+        empty={"results": []},
+    )
+    if served is not None:
+        return served
+
     target, error = _directory_target(path)
     if error is not None:
         return {"error": error, "results": []}
 
-    effective_exclude = _resolve_exclusions(exclude_dirs, include_excluded)
     max_seconds, max_entries = resolve_budget(target, max_seconds, max_entries)
 
     def _live_scan() -> dict:
@@ -147,7 +188,7 @@ def search_by_type(
             max_entries=max_entries,
         )
 
-    return get_or_scan(
+    result = get_or_scan(
         target,
         "search_by_type",
         str(target),
@@ -155,6 +196,8 @@ def search_by_type(
         file_type=file_type,
         **_budget_cache_key(max_seconds, max_entries),
     )
+    result.setdefault("source", "scan")
+    return result
 
 
 def get_file_metadata(path: str) -> dict:
@@ -198,8 +241,23 @@ def find_duplicates(
 
     Returns:
         Dict with 'duplicates' (list of duplicate group dicts), 'warnings'
-        (list of strings) and 'truncated' (None when complete).
+        (list of strings) and 'truncated' (None when complete). A root with an
+        index answers with size-only candidate groups (``hash`` None, contents
+        not read) and ``"source": "index"``.
     """
+    served = _index_result(
+        lambda: tree_index.find_duplicates(
+            path,
+            exclude_dirs=_resolve_exclusions(None, False),
+            hash_algo=hash_algo,
+            min_size=min_size,
+            max_entries=max_entries,
+        ),
+        empty={"duplicates": []},
+    )
+    if served is not None:
+        return served
+
     target, error = _directory_target(path)
     if error is not None:
         return {"error": error, "duplicates": []}
@@ -217,13 +275,15 @@ def find_duplicates(
             max_entries=max_entries,
         )
 
-    return get_or_scan(
+    result = get_or_scan(
         target,
         "find_duplicates",
         str(target),
         _live_scan,
         **_budget_cache_key(max_seconds, max_entries),
     )
+    result.setdefault("source", "scan")
+    return result
 
 
 def find_patterns(
@@ -246,8 +306,22 @@ def find_patterns(
 
     Returns:
         Dict with 'patterns' (list of pattern group dicts), 'warnings' (list of
-        strings) and 'truncated' (None when complete).
+        strings) and 'truncated' (None when complete). A root with an index is
+        answered from it with ``"source": "index"``.
     """
+    served = _index_result(
+        lambda: tree_index.find_patterns(
+            path,
+            exclude_dirs=_resolve_exclusions(None, False),
+            strategy=strategy,
+            min_group_size=min_group_size,
+            max_entries=max_entries,
+        ),
+        empty={"patterns": []},
+    )
+    if served is not None:
+        return served
+
     target, error = _directory_target(path)
     if error is not None:
         return {"error": error, "patterns": []}
@@ -265,13 +339,15 @@ def find_patterns(
             max_entries=max_entries,
         )
 
-    return get_or_scan(
+    result = get_or_scan(
         target,
         "find_patterns",
         str(target),
         _live_scan,
         **_budget_cache_key(max_seconds, max_entries),
     )
+    result.setdefault("source", "scan")
+    return result
 
 
 # Cache management tools
@@ -365,28 +441,40 @@ def cache_status(path: str | None = None) -> dict:
         path: Optional directory path. If not provided, searches from cwd upward.
 
     Returns:
-        Dict with entries, total_files, and size_bytes.
+        Dict with entries, total_files, and size_bytes. When ``path`` has an
+        index, its status is reported instead (``indexed: True`` plus the
+        per-type counts, total bytes and import time).
     """
     if path:
+        try:
+            status = tree_index.index_status(path)
+        except tree_index.IndexUnreadable as exc:
+            return {"error": str(exc), "indexed": False}
+        if status is not None:
+            return status
         target = Path(path).resolve()
-    else:
-        # Walk up from cwd to find nearest .filegraph/cache.db
-        current = Path.cwd()
-        target = None
-        while True:
-            db_path = current / ".filegraph" / "cache.db"
-            if db_path.exists():
-                target = current
-                break
-            parent = current.parent
-            if parent == current:
-                break
-            current = parent
+        stats = cache_stats(target)
+        stats["indexed"] = False
+        return stats
 
-        if target is None:
-            return {"entries": 0, "total_files": 0, "size_bytes": 0}
+    # Walk up from cwd to find nearest .filegraph/cache.db
+    current = Path.cwd()
+    target = None
+    while True:
+        db_path = current / ".filegraph" / "cache.db"
+        if db_path.exists():
+            target = current
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    if target is None:
+        return {"entries": 0, "total_files": 0, "size_bytes": 0, "indexed": False}
 
     stats = cache_stats(target)
+    stats["indexed"] = False
     return stats
 
 

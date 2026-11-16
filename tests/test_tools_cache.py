@@ -213,3 +213,20 @@ class TestFailedScanWritesNoCache:
             f"{os.strerror(errno.ESTALE)} (errno {errno.ESTALE}): {target}"
         )
         assert not (target / ".filegraph").exists()
+
+
+class TestNoIndexKeepsTodaysBehaviour:
+    """A root without an index is scanned live, exactly as before the index."""
+
+    def test_every_tool_marks_a_live_scan(self, tmp_path: Path) -> None:
+        (tmp_path / "a.txt").write_text("hello")
+        (tmp_path / "b.txt").write_text("hello")
+        for i in range(3):
+            (tmp_path / f"file_{i:03d}.txt").write_text("x")
+
+        assert scan_directory(str(tmp_path))["source"] == "scan"
+        assert search_by_type(str(tmp_path), "txt")["source"] == "scan"
+        assert find_duplicates(str(tmp_path))["source"] == "scan"
+        assert find_patterns(str(tmp_path))["source"] == "scan"
+        # No index is ever created for the root by serving it.
+        assert not (tmp_path / "index.db").exists()
