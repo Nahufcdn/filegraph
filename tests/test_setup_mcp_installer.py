@@ -177,7 +177,9 @@ def test_repair_rewrites_a_command_whose_shape_is_not_an_array(tmp_path):
     assert entry["command"] == [sys.executable, "-m", MODULE]
     assert entry["cwd"] == PROJECT_ROOT
     assert entry["enabled"] is False
-    assert "python3 -m src.main" in result.stdout
+    # Both halves of the repair notice: what the entry had, and what it becomes.
+    assert "'command' is not an array: \"python3 -m src.main\"" in result.stdout
+    assert "Rewriting it as [interpreter, -m, module]." in result.stdout
 
 
 def test_status_reports_a_non_array_command_instead_of_failing(tmp_path):
