@@ -64,6 +64,89 @@ def _block_listing(monkeypatch: pytest.MonkeyPatch, blocked: Path, seconds: floa
     monkeypatch.setattr(scanner, "_list_dir", _slow_list)
 
 
+def _block_classification(
+    monkeypatch: pytest.MonkeyPatch, blocked: Path, seconds: float = 30.0
+) -> None:
+    """Make the per-entry ``lstat`` block, like a CIFS stat stuck in the kernel.
+
+    On a network mount the listing can be fast while a single ``stat`` on one
+    already-listed entry hangs for tens of seconds. This is the expensive call
+    between knowing an entry exists and knowing what it is.
+    """
+    real = fsscan.lstat_path
+
+    def _slow(path, *args, **kwargs):
+        if Path(path) == blocked:
+            time.sleep(seconds)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(fsscan, "lstat_path", _slow)
+
+
+class _FakeScandirEntry:
+    """The only attribute a directory listing takes from an ``os.scandir`` entry."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _SlowScandir:
+    """A listing that streams ``names`` and then hangs on the rest of the directory."""
+
+    def __init__(self, target: Path, names: list[str], seconds: float) -> None:
+        self._names = list(names)
+        self._seconds = seconds
+        self._index = 0
+
+    def __iter__(self) -> _SlowScandir:
+        return self
+
+    def __next__(self) -> _FakeScandirEntry:
+        if self._index >= len(self._names):
+            # The kernel still owes us the rest of a huge directory.
+            time.sleep(self._seconds)
+            raise StopIteration
+        self._index += 1
+        return _FakeScandirEntry(self._names[self._index - 1])
+
+    def __enter__(self) -> _SlowScandir:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._index = len(self._names)
+
+
+def _block_mid_listing(
+    monkeypatch: pytest.MonkeyPatch, blocked: Path, names: list[str], seconds: float = 30.0
+) -> None:
+    """Make reading one directory slow at whichever API the scan uses.
+
+    The blocked directory holds ``names`` and then takes ``seconds`` more to
+    read, like a large share directory: a streaming read (``os.scandir``) hands
+    the names over before the hang, while a batch read (``os.listdir``, which
+    ``Path.iterdir`` uses) answers only once the whole directory is read.
+    """
+    real_scandir = os.scandir
+    real_listdir = os.listdir
+
+    def _scandir(path="."):
+        if Path(path) == blocked:
+            return _SlowScandir(blocked, names, seconds)
+        return real_scandir(path)
+
+    def _listdir(path="."):
+        if Path(path) == blocked:
+            time.sleep(seconds)
+            return list(names)
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    monkeypatch.setattr(os, "listdir", _listdir)
+
+
 def _child_names(node: dict) -> set[str]:
     return {child["name"] for child in node.get("children", [])}
 
@@ -239,6 +322,82 @@ class TestHardDeadline:
         assert elapsed < 5.0, f"tool blocked for {elapsed:.1f}s past its 0.5s deadline"
         assert "readable.txt" in _child_names(result["tree"])
 
+    def test_killed_scan_keeps_every_listed_entry(
+        self, local_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """S3 + S4: a stat stuck on the first entry must not erase the listing.
+
+        The child lists the whole directory in one call, then blocks inside the
+        first entry's ``stat``. Everything it already discovered has to reach the
+        parent's partial result, with ``entries_seen`` agreeing with it.
+        """
+        names = {"a.txt", "b-dir", "c.txt", "d-dir"}
+        (local_root / "b-dir").mkdir()
+        (local_root / "d-dir").mkdir()
+        for name in ("a.txt", "c.txt"):
+            (local_root / name).write_text("x")
+        # ``a.txt`` sorts first: the blocked stat happens before anything else.
+        _block_classification(monkeypatch, local_root / "a.txt", seconds=30)
+
+        started = time.monotonic()
+        result = _scan_tree_with(local_root, max_seconds=0.5)
+        elapsed = time.monotonic() - started
+
+        assert result["truncated"]["reason"] == TIME_BUDGET
+        assert elapsed < 5.0, f"tool blocked for {elapsed:.1f}s past its 0.5s deadline"
+        assert _child_names(result["tree"]) == names
+        assert result["truncated"]["entries_seen"] >= len(names)
+
+    def test_killed_scan_keeps_the_names_a_listing_still_arrived(
+        self, local_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """S3 + S4: a directory still being read keeps every name it produced.
+
+        A large share directory streams names for tens of seconds. A scan that
+        announces them only after the whole listing returns loses all of them
+        when the deadline kills it, which is 45 s of work and an empty tree.
+        Each name has to reach the caller as the listing produces it, and
+        ``entries_seen`` has to agree with what arrived.
+        """
+        names = [f"scan_{index:03d}.txt" for index in range(200)]
+        blocked = local_root / "big-dir"
+        blocked.mkdir()
+        for name in names:
+            (blocked / name).write_text("x")
+        _block_mid_listing(monkeypatch, blocked, names)
+
+        started = time.monotonic()
+        result = _scan_tree_with(local_root, max_seconds=0.5)
+        elapsed = time.monotonic() - started
+
+        assert result["truncated"]["reason"] == TIME_BUDGET
+        assert elapsed < 5.0, f"tool blocked for {elapsed:.1f}s past its 0.5s deadline"
+        big = next(
+            child for child in result["tree"]["children"] if child["name"] == "big-dir"
+        )
+        assert _child_names(big) == set(names)
+        # The directory itself plus every name that reached the caller.
+        assert result["truncated"]["entries_seen"] == len(names) + 1
+
+    def test_killed_scan_keeps_the_entry_types_it_did_read(
+        self, local_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PRESERVE: entries read before the block keep their real type."""
+        (local_root / "alpha").mkdir()
+        (local_root / "alpha" / "one.txt").write_text("x")
+        (local_root / "zeta.txt").write_text("x")
+        # ``zeta.txt`` sorts last, so ``alpha`` is fully read before the block.
+        _block_classification(monkeypatch, local_root / "zeta.txt", seconds=30)
+
+        result = _scan_tree_with(local_root, max_seconds=0.5)
+
+        assert result["truncated"]["reason"] == TIME_BUDGET
+        alpha = next(child for child in result["tree"]["children"] if child["name"] == "alpha")
+        assert alpha["type"] == "directory"
+        assert [(child["name"], child["type"]) for child in alpha["children"]] == [
+            ("one.txt", "file")
+        ]
+
     @pytest.mark.parametrize(
         ("tool", "key"),
         [("search", "results"), ("duplicates", "duplicates"), ("patterns", "patterns")],
@@ -384,6 +543,32 @@ class TestWorkerParity:
         assert budgeted["truncated"] is None
         assert budgeted["tree"] == in_process["tree"]
         assert budgeted["warnings"] == in_process["warnings"]
+
+    def test_complete_scan_keeps_sorted_order_and_exclusions(self, local_root: Path) -> None:
+        """PRESERVE: streaming a listing must not reorder a complete scan."""
+        from filegraph.scanner import scan_tree
+
+        # Created in an order that is not the sorted one, so the order the
+        # listing produced differs from the order the scan has to report.
+        (local_root / "m.txt").write_text("x")
+        (local_root / "z-dir").mkdir()
+        (local_root / "a.txt").write_text("x")
+        (local_root / "b.txt").write_text("x")
+        (local_root / ".git").mkdir()
+        (local_root / "node_modules").mkdir()
+
+        in_process = scan_tree(local_root)
+        budgeted = scan_tree(local_root, max_seconds=60)
+
+        assert in_process["truncated"] is None
+        assert [child["name"] for child in in_process["tree"]["children"]] == [
+            "a.txt",
+            "b.txt",
+            "m.txt",
+            "z-dir",
+        ]
+        assert budgeted["tree"] == in_process["tree"]
+        assert budgeted["truncated"] is None
 
 class TestNetworkFreshnessBudget:
     def test_freshness_walk_over_budget_is_stale_and_a_live_scan_runs(

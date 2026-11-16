@@ -197,7 +197,7 @@ class _Collector:
         self.warnings: list[str] = []
         self.error: str | None = None
         self.progress_entries = 0
-        self.entry_payloads = 0
+        self.entry_parts: set[tuple[str, ...]] = set()
 
     def run(self, connection: Any) -> None:
         while True:
@@ -216,8 +216,12 @@ class _Collector:
                     )
                 else:
                     self.partials.append(payload)
-                    if payload.get("kind") == "entry":
-                        self.entry_payloads += 1
+                    # A discovered entry and its typed follow-up describe the same
+                    # entry, so count paths, not messages.
+                    if payload.get("kind") in ("entry", "discovered"):
+                        parts = tuple(payload.get("parts") or ())
+                        if parts:
+                            self.entry_parts.add(parts)
             elif kind == "warn":
                 self.warnings.append(str(payload))
             elif kind == "done" and isinstance(payload, dict):
@@ -282,7 +286,7 @@ def run_worker(
         result=collector.result,
         partials=collector.partials,
         warnings=collector.warnings,
-        entries_seen=max(collector.progress_entries, collector.entry_payloads),
+        entries_seen=max(collector.progress_entries, len(collector.entry_parts)),
         error=collector.error,
         timed_out=timed_out,
     )

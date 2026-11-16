@@ -17,9 +17,18 @@ DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset(
 )
 
 
-def _list_dir(path: Path) -> list[Path]:
-    """List a directory sorted by name, letting filesystem errors propagate."""
-    return sorted(path.iterdir(), key=lambda p: p.name)
+def _list_dir(path: Path) -> Iterator[Path]:
+    """Yield a directory's entries one at a time, letting errors propagate.
+
+    Streaming is the point. ``os.scandir`` hands over each name as the kernel
+    returns it, so the caller can report entries while the directory is still
+    being read; a listing that materialises into a list first cannot, and a
+    directory that streams for tens of seconds on a network mount reported
+    nothing at all when a deadline stopped the scan mid-listing.
+    """
+    with os.scandir(path) as entries:
+        for entry in entries:
+            yield path / entry.name
 
 
 def _classify(path: Path) -> str:
@@ -179,7 +188,10 @@ def scan_tree(
     Returns a dict with keys: ``tree`` (nested dict), ``warnings`` (list of
     strings) and ``truncated`` (None for a complete scan, otherwise
     ``{"reason", "limit", "entries_seen"}``). Symlinks are recorded but not
-    followed. Filesystem errors produce partial results with warnings.
+    followed. Filesystem errors produce partial results with warnings. A scan
+    stopped by its deadline returns every entry its directory listings named,
+    using ``"unknown"`` as the type of the entries whose metadata was still
+    being read when it stopped, and ``entries_seen`` counts those entries too.
 
     Args:
         path: Root directory to scan.
@@ -229,34 +241,45 @@ def _scan_tree_worker(
 
 
 def _partial_tree(root: Path, partials: list[dict], warnings: list[str]) -> dict:
-    """Rebuild the tree a killed scan had streamed so far."""
+    """Rebuild the tree a killed scan had streamed so far.
+
+    Two payload kinds feed it: ``discovered``, sent as soon as a directory
+    listing named an entry, and ``entry``, sent once that entry's ``stat``
+    answered. The second refines the node the first created in place, so an
+    entry whose type never made it back still appears in the partial tree.
+    """
     nodes: dict[tuple[str, ...], dict] = {
         (): {"name": root.name or str(root), "type": "directory", "children": []}
     }
     for payload in partials:
-        if payload.get("kind") != "entry":
+        kind = payload.get("kind")
+        if kind not in ("entry", "discovered"):
             continue
         parts = tuple(payload.get("parts") or ())
         if not parts:
             continue
-        kind = payload.get("type")
-        node: dict = {"name": parts[-1]}
-        if kind == "file":
+        node = nodes.get(parts)
+        if node is None:
+            node = {"name": parts[-1]}
+            nodes[parts] = node
+            parent = nodes.get(parts[:-1])
+            if parent is not None:
+                parent.setdefault("children", []).append(node)
+        if kind == "discovered":
+            node.setdefault("type", "unknown")
+            continue
+        entry_kind = payload.get("type")
+        if entry_kind == "file":
             node["type"] = "file"
-        elif kind == "symlink":
+            node.pop("children", None)
+        elif entry_kind == "symlink":
             node["type"] = "symlink"
             node["target"] = payload.get("target") or ""
-        elif kind == "directory":
+        elif entry_kind == "directory":
             node["type"] = "directory"
-            node["children"] = []
+            node.setdefault("children", [])
         else:
             node["type"] = "unknown"
-        nodes[parts] = node
-        parent = nodes.get(parts[:-1])
-        if parent is not None:
-            children = parent.setdefault("children", [])
-            if node not in children:
-                children.append(node)
     return {"tree": nodes[()], "warnings": list(warnings), "truncated": None}
 
 
@@ -293,15 +316,30 @@ def _scan_node(
     if budget.truncated is not None:
         return {"name": name, "type": "directory", "children": []}
 
+    effective_exclude = exclude_dirs if exclude_dirs is not None else DEFAULT_EXCLUDED_DIRS
+    # Announce each name while the directory is still being read, then process
+    # the entries in sorted order. Announcing only after the listing completes
+    # loses everything a large directory already named: reading it streams for
+    # tens of seconds on a network mount, and the deadline kills the child long
+    # before the listing returns. Classifying is a round trip too, and one stuck
+    # ``stat`` can block for minutes, so an entry announced only after being
+    # classified is lost as well. Names a name-exclusion hides are not announced,
+    # so a partial tree keeps the exclusions a complete one has. ``entries``
+    # holds what the previous ``sorted(...)`` held, and a listing that fails
+    # midway keeps the names it did produce instead of dropping them all.
+    entries: list[Path] = []
     try:
-        entries = _list_dir(path)
+        for entry in _list_dir(path):
+            entries.append(entry)
+            if entry.name not in effective_exclude:
+                budget.emit({"kind": "discovered", "parts": list(parts + (entry.name,))})
     except OSError as exc:
         budget.warn(f"Error reading {path}: {fsscan.error_detail(exc)}")
-        return {"name": name, "type": "directory", "children": []}
+    entries.sort(key=lambda entry: entry.name)
 
-    effective_exclude = exclude_dirs if exclude_dirs is not None else DEFAULT_EXCLUDED_DIRS
     children: list[dict] = []
     for entry in entries:
+        child_parts = parts + (entry.name,)
         try:
             child_kind = _classify(entry)
         except OSError as exc:
@@ -312,7 +350,6 @@ def _scan_node(
         if child_kind == "directory" and entry.name in effective_exclude:
             continue
 
-        child_parts = parts + (entry.name,)
         streamed = {
             "kind": "entry",
             "parts": list(child_parts),
